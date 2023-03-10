@@ -1,6 +1,7 @@
 import os
+import string
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -28,7 +29,7 @@ LANGUAGES = {
     "hi": "hindi",
     "fi": "finnish",
     "vi": "vietnamese",
-    "iw": "hebrew",
+    "he": "hebrew",
     "uk": "ukrainian",
     "el": "greek",
     "ms": "malay",
@@ -137,7 +138,9 @@ class Tokenizer:
     def encode(self, text, **kwargs):
         return self.tokenizer.encode(text, **kwargs)
 
-    def decode(self, token_ids: Union[int, List[int], np.ndarray, torch.Tensor], **kwargs):
+    def decode(
+        self, token_ids: Union[int, List[int], np.ndarray, torch.Tensor], **kwargs
+    ):
         return self.tokenizer.decode(token_ids, **kwargs)
 
     def decode_with_timestamps(self, tokens) -> str:
@@ -153,50 +156,51 @@ class Tokenizer:
                 outputs.append([])
             else:
                 outputs[-1].append(token)
-        outputs = [s if isinstance(s, str) else self.tokenizer.decode(s) for s in outputs]
-        return "".join(outputs)
+        return "".join(
+            [s if isinstance(s, str) else self.tokenizer.decode(s) for s in outputs]
+        )
 
-    @property
-    @lru_cache()
+    @cached_property
     def eot(self) -> int:
         return self.tokenizer.eos_token_id
 
-    @property
-    @lru_cache()
+    @cached_property
+    def transcribe(self) -> int:
+        return self._get_single_token_id("<|transcribe|>")
+
+    @cached_property
+    def translate(self) -> int:
+        return self._get_single_token_id("<|translate|>")
+
+    @cached_property
     def sot(self) -> int:
         return self._get_single_token_id("<|startoftranscript|>")
 
-    @property
-    @lru_cache()
+    @cached_property
     def sot_lm(self) -> int:
         return self._get_single_token_id("<|startoflm|>")
 
-    @property
-    @lru_cache()
+    @cached_property
     def sot_prev(self) -> int:
         return self._get_single_token_id("<|startofprev|>")
 
-    @property
-    @lru_cache()
+    @cached_property
     def no_speech(self) -> int:
         return self._get_single_token_id("<|nospeech|>")
 
-    @property
-    @lru_cache()
+    @cached_property
     def no_timestamps(self) -> int:
         return self._get_single_token_id("<|notimestamps|>")
 
-    @property
-    @lru_cache()
+    @cached_property
     def timestamp_begin(self) -> int:
         return self.tokenizer.all_special_ids[-1] + 1
 
-    @property
-    @lru_cache()
+    @cached_property
     def language_token(self) -> int:
         """Returns the token id corresponding to the value of the `language` field"""
         if self.language is None:
-            raise ValueError(f"This tokenizer does not have language token configured")
+            raise ValueError("This tokenizer does not have language token configured")
 
         additional_tokens = dict(
             zip(
@@ -210,8 +214,7 @@ class Tokenizer:
 
         raise KeyError(f"Language {self.language} not found in tokenizer.")
 
-    @property
-    @lru_cache()
+    @cached_property
     def all_language_tokens(self) -> Tuple[int]:
         result = []
         for token, token_id in zip(
@@ -222,18 +225,15 @@ class Tokenizer:
                 result.append(token_id)
         return tuple(result)
 
-    @property
-    @lru_cache()
+    @cached_property
     def all_language_codes(self) -> Tuple[str]:
         return tuple(self.decode([l]).strip("<|>") for l in self.all_language_tokens)
 
-    @property
-    @lru_cache()
+    @cached_property
     def sot_sequence_including_notimestamps(self) -> Tuple[int]:
         return tuple(list(self.sot_sequence) + [self.no_timestamps])
 
-    @property
-    @lru_cache()
+    @cached_property
     def non_speech_tokens(self) -> Tuple[int]:
         """
         Returns the list of tokens to suppress in order to avoid any speaker tags or non-speech
@@ -245,8 +245,10 @@ class Tokenizer:
 
         keeping basic punctuations like commas, periods, question marks, exclamation points, etc.
         """
-        symbols = list("\"#()*+/:;<=>@[\\]^_`{|}~「」『』")
-        symbols += "<< >> <<< >>> -- --- -( -[ (' (\" (( )) ((( ))) [[ ]] {{ }} ♪♪ ♪♪♪".split()
+        symbols = list('"#()*+/:;<=>@[\\]^_`{|}~「」『』')
+        symbols += (
+            "<< >> <<< >>> -- --- -( -[ (' (\" (( )) ((( ))) [[ ]] {{ }} ♪♪ ♪♪♪".split()
+        )
 
         # symbols that may be a single token or multiple tokens depending on the tokenizer.
         # In case they're multiple tokens, suppress the first token, which is safe because:
@@ -258,7 +260,10 @@ class Tokenizer:
         # allow hyphens "-" and single quotes "'" between words, but not at the beginning of a word
         result = {self.tokenizer.encode(" -")[0], self.tokenizer.encode(" '")[0]}
         for symbol in symbols + list(miscellaneous):
-            for tokens in [self.tokenizer.encode(symbol), self.tokenizer.encode(" " + symbol)]:
+            for tokens in [
+                self.tokenizer.encode(symbol),
+                self.tokenizer.encode(" " + symbol),
+            ]:
                 if len(tokens) == 1 or symbol in miscellaneous:
                     result.add(tokens[0])
 
@@ -268,6 +273,48 @@ class Tokenizer:
         tokens = self.tokenizer.encode(text)
         assert len(tokens) == 1, f"{text} is not encoded as a single token"
         return tokens[0]
+
+    def split_to_word_tokens(self, tokens: List[int]):
+        if self.language in {"zh", "ja", "th", "lo", "my"}:
+            # These languages don't typically use spaces, so it is difficult to split words
+            # without morpheme analysis. Here, we instead split words at any
+            # position where the tokens are decoded as valid unicode points
+            return self.split_tokens_on_unicode(tokens)
+
+        return self.split_tokens_on_spaces(tokens)
+
+    def split_tokens_on_unicode(self, tokens: List[int]):
+        words = []
+        word_tokens = []
+        current_tokens = []
+
+        for token in tokens:
+            current_tokens.append(token)
+            decoded = self.decode_with_timestamps(current_tokens)
+            if "\ufffd" not in decoded:
+                words.append(decoded)
+                word_tokens.append(current_tokens)
+                current_tokens = []
+
+        return words, word_tokens
+
+    def split_tokens_on_spaces(self, tokens: List[int]):
+        subwords, subword_tokens_list = self.split_tokens_on_unicode(tokens)
+        words = []
+        word_tokens = []
+
+        for subword, subword_tokens in zip(subwords, subword_tokens_list):
+            special = subword_tokens[0] >= self.eot
+            with_space = subword.startswith(" ")
+            punctuation = subword.strip() in string.punctuation
+            if special or with_space or punctuation or len(words) == 0:
+                words.append(subword)
+                word_tokens.append(subword_tokens)
+            else:
+                words[-1] = words[-1] + subword
+                word_tokens[-1].extend(subword_tokens)
+
+        return words, word_tokens
 
 
 @lru_cache(maxsize=None)
@@ -328,4 +375,6 @@ def get_tokenizer(
     if task is not None:
         sot_sequence.append(transcribe if task == "transcribe" else translate)
 
-    return Tokenizer(tokenizer=tokenizer, language=language, sot_sequence=tuple(sot_sequence))
+    return Tokenizer(
+        tokenizer=tokenizer, language=language, sot_sequence=tuple(sot_sequence)
+    )
